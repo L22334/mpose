@@ -82,6 +82,140 @@ opWrapper = op.WrapperPython()
 opWrapper.configure(params)
 opWrapper.start()
 
+# 添加骨骼对定义（成对的关键点定义骨骼）
+SKELETON_PAIRS = {
+    'upper_arm_right': (6, 8),   # 右肩到右肘
+    'lower_arm_right': (8, 10),  # 右肘到右腕
+    'upper_arm_left': (5, 7),    # 左肩到左肘
+    'lower_arm_left': (7, 9),    # 左肘到左腕
+    'upper_leg_right': (12, 14), # 右髋到右膝
+    'lower_leg_right': (14, 16), # 右膝到右踝
+    'upper_leg_left': (11, 13),  # 左髋到左膝
+    'lower_leg_left': (13, 15),  # 左膝到左踝
+    'shoulder_width': (5, 6),    # 肩宽
+    'hip_width': (11, 12),       # 髋宽
+}
+
+class SkeletonConsistencyChecker:
+    def __init__(self, window_size=30):
+        self.window_size = window_size
+        self.bone_lengths = {}
+        self.bone_length_history = {bone: deque(maxlen=window_size) for bone in SKELETON_PAIRS}
+        self.reference_ratios = {
+            'arm_symmetry': 1.0,      # Arm length ratio
+            'leg_symmetry': 1.0,      # Leg length ratio
+            'arm_leg_ratio': 0.8,     # Arm to leg ratio
+            'shoulder_hip_ratio': 1.2  # Shoulder to hip width ratio
+        }
+        self.tolerance = 0.2  # Allowed error range (20%)
+
+    def calculate_bone_length(self, keypoints, start_idx, end_idx):
+        """计算两个关键点之间的距离"""
+        if (keypoints[start_idx][2] > 0.5 and 
+            keypoints[end_idx][2] > 0.5):  # 检查置信度
+            start = keypoints[start_idx][:2]
+            end = keypoints[end_idx][:2]
+            return np.sqrt(np.sum((start - end) ** 2))
+        return None
+
+    def update_bone_lengths(self, keypoints):
+        """更新所有骨骼长度的历史记录"""
+        current_lengths = {}
+        
+        for bone_name, (start_idx, end_idx) in SKELETON_PAIRS.items():
+            length = self.calculate_bone_length(keypoints, start_idx, end_idx)
+            if length is not None:
+                current_lengths[bone_name] = length
+                self.bone_length_history[bone_name].append(length)
+        
+        return current_lengths
+
+    def get_stable_bone_lengths(self):
+        """获取稳定的骨骼长度（使用中位数）"""
+        stable_lengths = {}
+        for bone_name in SKELETON_PAIRS:
+            if len(self.bone_length_history[bone_name]) > 0:
+                stable_lengths[bone_name] = np.median(self.bone_length_history[bone_name])
+        return stable_lengths
+
+    def check_symmetry(self, current_lengths):
+        """Check skeleton symmetry"""
+        issues = []
+        
+        # 检查手臂对称性
+        if ('upper_arm_left' in current_lengths and 
+            'upper_arm_right' in current_lengths):
+            ratio = (current_lengths['upper_arm_left'] / 
+                    current_lengths['upper_arm_right'])
+            if abs(ratio - self.reference_ratios['arm_symmetry']) > self.tolerance:
+                issues.append(f"Arm Asymmetry: {ratio:.2f}")
+
+        # 检查腿部对称性
+        if ('upper_leg_left' in current_lengths and 
+            'upper_leg_right' in current_lengths):
+            ratio = (current_lengths['upper_leg_left'] / 
+                    current_lengths['upper_leg_right'])
+            if abs(ratio - self.reference_ratios['leg_symmetry']) > self.tolerance:
+                issues.append(f"Leg Asymmetry: {ratio:.2f}")
+
+        return issues
+
+    def check_proportions(self, current_lengths):
+        """Check body proportions"""
+        issues = []
+        
+        # 计算手臂总长
+        left_arm = (current_lengths.get('upper_arm_left', 0) + 
+                   current_lengths.get('lower_arm_left', 0))
+        right_arm = (current_lengths.get('upper_arm_right', 0) + 
+                    current_lengths.get('lower_arm_right', 0))
+        
+        # 计算腿部总长
+        left_leg = (current_lengths.get('upper_leg_left', 0) + 
+                   current_lengths.get('lower_leg_left', 0))
+        right_leg = (current_lengths.get('upper_leg_right', 0) + 
+                    current_lengths.get('lower_leg_right', 0))
+
+        # 检查手臂与腿的比例
+        if left_arm > 0 and left_leg > 0:
+            ratio = left_arm / left_leg
+            if abs(ratio - self.reference_ratios['arm_leg_ratio']) > self.tolerance:
+                issues.append(f"Abnormal Arm-Leg Ratio: {ratio:.2f}")
+
+        # 检查肩宽与髋宽的比例
+        if ('shoulder_width' in current_lengths and 
+            'hip_width' in current_lengths):
+            ratio = (current_lengths['shoulder_width'] / 
+                    current_lengths['hip_width'])
+            if abs(ratio - self.reference_ratios['shoulder_hip_ratio']) > self.tolerance:
+                issues.append(f"Abnormal Shoulder-Hip Ratio: {ratio:.2f}")
+
+        return issues
+
+    def check_consistency(self, keypoints):
+        """Main checking function, returns all consistency issues"""
+        if keypoints is None:
+            return []
+
+        current_lengths = self.update_bone_lengths(keypoints)
+        if not current_lengths:
+            return []
+
+        stable_lengths = self.get_stable_bone_lengths()
+
+        issues = []
+        issues.extend(self.check_symmetry(current_lengths))
+        issues.extend(self.check_proportions(current_lengths))
+
+        # 检查骨骼长度的突变
+        for bone_name, current_length in current_lengths.items():
+            if bone_name in stable_lengths:
+                stable_length = stable_lengths[bone_name]
+                if abs(current_length - stable_length) / stable_length > self.tolerance:
+                    issues.append(f"Abnormal {bone_name} length change")
+
+        return issues
+
 class KeypointSmoother:
     def __init__(self, window_size=5):
         self.window_size = window_size
@@ -262,6 +396,13 @@ def process_frame(frame):
                         "Analysis": [f"{result}" for result in analysis_results[:3]]
                     })
         
+        # 检查骨骼一致性
+        if smoothed_kpts is not None:
+            # 检查骨骼一致性
+            consistency_issues = skeleton_checker.check_consistency(smoothed_kpts)
+            if consistency_issues:
+                info_dict["Consistency"] = consistency_issues
+                
         # 更新显示帧
         if hasattr(datum, "cvOutputData"):
             openpose_frame = datum.cvOutputData
@@ -434,6 +575,10 @@ def main():
     
     global smoother
     smoother = KeypointSmoother(window_size=5)
+    
+    # 初始化骨骼一致性检查器
+    global skeleton_checker
+    skeleton_checker = SkeletonConsistencyChecker()
     
     running = True  # 添加运行状态标志
     
