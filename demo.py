@@ -267,7 +267,7 @@ def calculate_confidence(keypoints):
     return np.mean(valid_confs) if valid_confs else 0.0
 
 def analyze_pose(keypoints):
-    """分析姿态并返回建议"""
+    """增强的姿态分析函数"""
     results = []
     
     try:
@@ -277,17 +277,25 @@ def analyze_pose(keypoints):
             hip_angle = calculate_angle(keypoints[11], keypoints[12])
             
             if abs(shoulder_angle) > 10:
-                results.append(f"Shoulder Tilt: {shoulder_angle:.1f} deg")
+                results.append(f"Shoulder Tilt: {shoulder_angle:.1f}°")
             if abs(hip_angle) > 10:
-                results.append(f"Hip Tilt: {hip_angle:.1f} deg")
+                results.append(f"Hip Tilt: {hip_angle:.1f}°")
         
         # 分析弯腰程度
         if all(keypoints[i][2] > 0.5 for i in [5, 11, 13]):  # 左侧身体关键点可见
             bend_angle = calculate_angle(keypoints[5], keypoints[11], keypoints[13])
             if bend_angle < 120:
-                results.append(f"Bending Angle: {bend_angle:.1f} deg")
+                results.append(f"Significant Bending: {bend_angle:.1f}°")
             elif bend_angle < 150:
-                results.append(f"Slight Bending: {bend_angle:.1f} deg")
+                results.append(f"Slight Bending: {bend_angle:.1f}°")
+                
+        # 添加稳定性分析结果
+        stability_results = posture_stability_analyzer.analyze_posture_stability()
+        if stability_results["warnings"]:
+            results.extend(stability_results["warnings"])
+        
+        # 添加整体稳定性评分
+        results.append(f"Stability Score: {stability_results['overall_stability']}")
                 
     except Exception as e:
         print(f"姿态分析错误: {str(e)}")
@@ -419,6 +427,15 @@ def process_frame(frame):
         # 存储结果用于信息面板显示
         process_frame.last_results = info_dict
         
+        if smoothed_kpts is not None:
+            # 更新姿态稳定性分析器
+            posture_stability_analyzer.add_pose(smoothed_kpts)
+            
+            # 分析姿态并更新信息字典
+            analysis_results = analyze_pose(smoothed_kpts)
+            if analysis_results:
+                info_dict["Analysis"] = analysis_results
+                
         return openpose_frame, yolo_frame, mixed_frame
         
     except Exception as e:
@@ -744,6 +761,141 @@ class PoseFusion:
             "Stable Points": f"{sum(1 for kpt in latest if kpt[2] > 0.5)}/17"
         }
 
+class PostureStabilityAnalyzer:
+    def __init__(self, window_size=30):  # 使用30帧窗口
+        self.window_size = window_size
+        self.pose_history = deque(maxlen=window_size)
+        self.stability_thresholds = {
+            'shoulder': 15.0,  # 肩部角度变化阈值
+            'spine': 20.0,    # 脊柱角度变化阈值
+            'hip': 15.0,      # 髋部角度变化阈值
+            'position': 30.0  # 位置变化阈值(像素)
+        }
+        
+    def add_pose(self, keypoints):
+        """添加新的姿态帧到历史记录"""
+        if keypoints is not None and len(keypoints) > 0:
+            self.pose_history.append(keypoints)
+            
+    def calculate_joint_stability(self, joint_idx):
+        """计算特定关节点的稳定性"""
+        if len(self.pose_history) < 2:
+            return 1.0, 0.0
+            
+        positions = []
+        for pose in self.pose_history:
+            if pose[joint_idx][2] > 0.5:  # 只考虑置信度高的点
+                positions.append(pose[joint_idx][:2])
+                
+        if len(positions) < 2:
+            return 1.0, 0.0
+            
+        positions = np.array(positions)
+        # 计算位置标准差
+        std_dev = np.std(positions, axis=0)
+        max_deviation = np.max(std_dev)
+        
+        # 计算稳定性分数 (0-1)
+        stability = max(0, 1 - max_deviation / self.stability_thresholds['position'])
+        return stability, max_deviation
+        
+    def analyze_posture_stability(self):
+        """分析整体姿态稳定性"""
+        if len(self.pose_history) < self.window_size // 2:
+            return {
+                "overall_stability": "Insufficient Data",
+                "details": {},
+                "warnings": []
+            }
+            
+        stability_scores = {}
+        warnings = []
+        
+        # 分析关键关节的稳定性
+        key_joints = {
+            'left_shoulder': 5,
+            'right_shoulder': 6,
+            'left_hip': 11,
+            'right_hip': 12,
+            'left_knee': 13,
+            'right_knee': 14
+        }
+        
+        for joint_name, joint_idx in key_joints.items():
+            stability, deviation = self.calculate_joint_stability(joint_idx)
+            stability_scores[joint_name] = stability
+            
+            if stability < 0.6:
+                warnings.append(f"Unstable {joint_name.replace('_', ' ')}: {(1-stability)*100:.1f}% movement")
+                
+        # 分析躯干稳定性
+        trunk_stability = self.analyze_trunk_stability()
+        stability_scores['trunk'] = trunk_stability
+        
+        if trunk_stability < 0.6:
+            warnings.append(f"Unstable trunk position: {(1-trunk_stability)*100:.1f}% movement")
+            
+        # 计算整体稳定性分数
+        overall_stability = np.mean(list(stability_scores.values()))
+        
+        # 分析姿态变化趋势
+        trend_analysis = self.analyze_pose_trend()
+        if trend_analysis:
+            warnings.extend(trend_analysis)
+            
+        return {
+            "overall_stability": f"{overall_stability:.2f}",
+            "details": stability_scores,
+            "warnings": warnings
+        }
+        
+    def analyze_trunk_stability(self):
+        """分析躯干稳定性"""
+        if len(self.pose_history) < 2:
+            return 1.0
+            
+        spine_angles = []
+        for pose in self.pose_history:
+            # 计算脊柱角度（肩部中点到髋部中点）
+            if all(pose[i][2] > 0.5 for i in [5, 6, 11, 12]):
+                shoulder_mid = (pose[5][:2] + pose[6][:2]) / 2
+                hip_mid = (pose[11][:2] + pose[12][:2]) / 2
+                angle = calculate_angle(shoulder_mid, hip_mid)
+                spine_angles.append(angle)
+                
+        if not spine_angles:
+            return 1.0
+            
+        # 计算角度变化的标准差
+        angle_std = np.std(spine_angles)
+        stability = max(0, 1 - angle_std / self.stability_thresholds['spine'])
+        return stability
+        
+    def analyze_pose_trend(self):
+        """分析姿态变化趋势"""
+        if len(self.pose_history) < self.window_size:
+            return []
+            
+        warnings = []
+        recent_poses = list(self.pose_history)[-10:]  # 分析最近10帧
+        
+        # 检测躯干前倾趋势
+        spine_angles = []
+        for pose in recent_poses:
+            if all(pose[i][2] > 0.5 for i in [5, 6, 11, 12]):
+                shoulder_mid = (pose[5][:2] + pose[6][:2]) / 2
+                hip_mid = (pose[11][:2] + pose[12][:2]) / 2
+                angle = calculate_angle(shoulder_mid, hip_mid)
+                spine_angles.append(angle)
+                
+        if spine_angles:
+            angle_trend = np.polyfit(range(len(spine_angles)), spine_angles, 1)[0]
+            if abs(angle_trend) > 1.0:
+                trend_direction = "forward" if angle_trend > 0 else "backward"
+                warnings.append(f"Gradual {trend_direction} leaning detected")
+                
+        return warnings
+
 def main():
     """主函数"""
     if USE_CAMERA:
@@ -765,6 +917,10 @@ def main():
     # 初始化姿态融合器
     global pose_fusion
     pose_fusion = PoseFusion()
+    
+    # 初始化姿态稳定性分析器
+    global posture_stability_analyzer
+    posture_stability_analyzer = PostureStabilityAnalyzer()
     
     running = True  # 添加运行状态标志
     
