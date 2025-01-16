@@ -381,20 +381,27 @@ def process_frame(frame):
                 total_conf = openpose_conf + yolo_conf
                 weight = yolo_conf / total_conf if total_conf > 0 else 0.5
                 
-                combined_kpts = weight * yolo_kpts + (1 - weight) * openpose_kpts
-                smoothed_kpts = smoother.update(combined_kpts)
+                # 确保混合帧是原始帧的副本
+                mixed_frame = frame.copy()
                 
-                if smoothed_kpts is not None:
-                    draw_skeleton(mixed_frame, smoothed_kpts)
-                    analysis_results = analyze_pose(smoothed_kpts)
+                # 融合关键点
+                fused_kpts = pose_fusion.fuse_keypoints(yolo_kpts, openpose_kpts)
+                
+                if fused_kpts is not None:
+                    # 应用平滑
+                    smoothed_kpts = smoother.update(fused_kpts)
                     
-                    info_dict.update({
-                        "YOLO": f"Conf: {yolo_conf:.2f}",
-                        "OpenPose": f"Conf: {openpose_conf:.2f}",
-                        "Fusion": f"Weight: {weight:.2f}",
-                        "Keypoints": f"{sum(1 for kpt in smoothed_kpts if kpt[2] > 0.5)}/17",
-                        "Analysis": [f"{result}" for result in analysis_results[:3]]
-                    })
+                    if smoothed_kpts is not None:
+                        # 在混合帧上绘制骨架
+                        draw_skeleton(mixed_frame, smoothed_kpts)
+                        
+                        # 更新信息
+                        fusion_info = pose_fusion.get_fusion_info()
+                        info_dict.update({
+                            "Fusion": fusion_info["Average Confidence"],
+                            "Motion": fusion_info["Motion Level"],
+                            "Keypoints": fusion_info["Stable Points"]
+                        })
         
         # 检查骨骼一致性
         if smoothed_kpts is not None:
@@ -418,26 +425,60 @@ def process_frame(frame):
         print(f"处理帧时发生错误: {str(e)}")
         return frame, frame, frame
 
-def draw_skeleton(frame, keypoints):
-    """只绘制骨架和关键点，不添加文字标注"""
-    # 绘制关键点
-    for i, (x, y, conf) in enumerate(keypoints):
-        if conf > 0.5:
-            x, y = int(x), int(y)
-            color = get_confidence_color(conf)
-            cv2.circle(frame, (x, y), 4, (0, 0, 0), -1)  # 黑色外圈
-            cv2.circle(frame, (x, y), 3, color, -1)      # 颜色随置信度变化
+def draw_skeleton(frame, keypoints, thickness=2):
+    """改进的骨架绘制函数"""
+    if keypoints is None:
+        return
+        
+    # 定义骨架连接和颜色映射
+    SKELETON_CONNECTIONS = {
+        # 躯干
+        (5, 6): (0, 255, 0),   # 肩膀连接 - 绿色
+        (5, 11): (255, 0, 0),  # 左躯干 - 红色
+        (6, 12): (255, 0, 0),  # 右躯干 - 红色
+        (11, 12): (0, 255, 0), # 髋部连接 - 绿色
+        
+        # 手臂
+        (5, 7): (255, 165, 0),  # 左上臂 - 橙色
+        (6, 8): (255, 165, 0),  # 右上臂 - 橙色
+        (7, 9): (255, 255, 0),  # 左前臂 - 黄色
+        (8, 10): (255, 255, 0), # 右前臂 - 黄色
+        
+        # 腿部
+        (11, 13): (0, 255, 255), # 左大腿 - 青色
+        (12, 14): (0, 255, 255), # 右大腿 - 青色
+        (13, 15): (0, 165, 255), # 左小腿 - 橙色
+        (14, 16): (0, 165, 255), # 右小腿 - 橙色
+    }
     
     # 绘制骨架连接
-    for i in YOLO_CONNECTIONS:
-        for j in YOLO_CONNECTIONS[i]:
-            if keypoints[i][2] > 0.5 and keypoints[j][2] > 0.5:
-                pt1 = (int(keypoints[i][0]), int(keypoints[i][1]))
-                pt2 = (int(keypoints[j][0]), int(keypoints[j][1]))
-                conf = (keypoints[i][2] + keypoints[j][2]) / 2
-                color = get_confidence_color(conf)
-                cv2.line(frame, pt1, pt2, (0, 0, 0), 3)  # 黑色外边框
-                cv2.line(frame, pt1, pt2, color, 1)      # 颜色随置信度变化
+    for (start_joint, end_joint), color in SKELETON_CONNECTIONS.items():
+        if (keypoints[start_joint][2] > 0.5 and 
+            keypoints[end_joint][2] > 0.5):  # 只绘制置信度高的连接
+            
+            start_point = tuple(map(int, keypoints[start_joint][:2]))
+            end_point = tuple(map(int, keypoints[end_joint][:2]))
+            
+            # 绘制连接线（先画粗黑线，再画细色线，提高可见性）
+            cv2.line(frame, start_point, end_point, (0, 0, 0), thickness + 2)
+            cv2.line(frame, start_point, end_point, color, thickness)
+
+    # 绘制关键点
+    for i, (x, y, conf) in enumerate(keypoints):
+        if conf > 0.5:  # 只绘制置信度高的关键点
+            x, y = int(x), int(y)
+            # 绘制关键点（黑色外圈 + 彩色内圈）
+            cv2.circle(frame, (x, y), 6, (0, 0, 0), -1)
+            
+            # 根据关键点类型选择颜色
+            if i in [5, 6, 11, 12]:  # 躯干关键点
+                color = (0, 255, 0)  # 绿色
+            elif i in [7, 8, 9, 10]:  # 手臂关键点
+                color = (255, 165, 0)  # 橙色
+            else:  # 腿部关键点
+                color = (0, 255, 255)  # 青色
+                
+            cv2.circle(frame, (x, y), 4, color, -1)
 
 def get_confidence_color(conf):
     """根据置信度返回颜色"""
@@ -562,6 +603,147 @@ def create_display_window(openpose_frame, yolo_frame, mixed_frame, info_dict):
     
     return final_display
 
+class PoseFusion:
+    def __init__(self):
+        # 微调权重配置
+        self.joint_weights = {
+            # 躯干核心关键点
+            5: {'yolo': 0.85, 'openpose': 0.15},  # 左肩
+            6: {'yolo': 0.85, 'openpose': 0.15},  # 右肩
+            11: {'yolo': 0.85, 'openpose': 0.15}, # 左髋
+            12: {'yolo': 0.85, 'openpose': 0.15}, # 右髋
+            
+            # 上肢关键点
+            7: {'yolo': 0.8, 'openpose': 0.2},   # 左肘
+            8: {'yolo': 0.8, 'openpose': 0.2},   # 右肘
+            9: {'yolo': 0.8, 'openpose': 0.2},   # 左腕
+            10: {'yolo': 0.8, 'openpose': 0.2},  # 右腕
+            
+            # 下肢关键点
+            13: {'yolo': 0.8, 'openpose': 0.2},  # 左膝
+            14: {'yolo': 0.8, 'openpose': 0.2},  # 右膝
+            15: {'yolo': 0.8, 'openpose': 0.2},  # 左踝
+            16: {'yolo': 0.8, 'openpose': 0.2},  # 右踝
+        }
+        
+        # 调整参数
+        self.confidence_threshold = 0.35  # 降低置信度阈值
+        self.motion_threshold = 30       # 增加运动阈值
+        self.position_threshold = 45     # 增加位置阈值
+        self.history = deque(maxlen=5)    # 保持5帧历史记录
+        
+    def validate_keypoints(self, keypoints, reference_points):
+        """验证关键点是否在合理范围内"""
+        if keypoints is None or reference_points is None:
+            return False
+            
+        # 计算参考点的中心位置（使用躯干关键点）
+        ref_points = [5, 6, 11, 12]  # 肩部和髋部关键点
+        ref_center = np.mean([reference_points[i][:2] for i in ref_points 
+                            if reference_points[i][2] > 0.5], axis=0)
+        
+        # 计算待验证点的中心位置
+        kpt_center = np.mean([keypoints[i][:2] for i in ref_points 
+                            if keypoints[i][2] > 0.5], axis=0)
+        
+        # 如果两个中心点距离过大，认为是无效检测
+        if np.linalg.norm(ref_center - kpt_center) > self.position_threshold:
+            return False
+            
+        return True
+
+    def fuse_keypoints(self, yolo_kpts, op_kpts):
+        """优化的融合策略"""
+        if yolo_kpts is None and op_kpts is None:
+            return None
+            
+        # 优先使用YOLO结果作为基准
+        reference_kpts = yolo_kpts if yolo_kpts is not None else op_kpts
+        fused_kpts = reference_kpts.copy()
+        
+        if yolo_kpts is None or op_kpts is None:
+            return fused_kpts
+            
+        # 验证关键点
+        if not self.validate_keypoints(op_kpts, reference_kpts):
+            return reference_kpts
+            
+        # 融合过程
+        for joint_id in range(len(yolo_kpts)):
+            yolo_conf = yolo_kpts[joint_id][2]
+            op_conf = op_kpts[joint_id][2]
+            
+            # 对于低置信度的点，优先使用YOLO结果
+            if yolo_conf < self.confidence_threshold and op_conf < self.confidence_threshold:
+                fused_kpts[joint_id] = yolo_kpts[joint_id]
+                continue
+                
+            # 获取预设权重
+            weights = self.joint_weights.get(joint_id, {'yolo': 0.7, 'openpose': 0.3})
+            w_yolo = weights['yolo']
+            w_op = weights['openpose']
+            
+            # 根据置信度微调权重
+            total_conf = yolo_conf + op_conf
+            if total_conf > 0:
+                # 保持YOLO的主导地位，但允许根据置信度小幅调整
+                base_yolo_weight = weights['yolo']
+                conf_ratio = yolo_conf / total_conf
+                w_yolo = min(0.9, max(base_yolo_weight, conf_ratio))
+                w_op = 1 - w_yolo
+            
+            # 计算融合位置
+            fused_pos = (w_yolo * yolo_kpts[joint_id][:2] + 
+                        w_op * op_kpts[joint_id][:2])
+            
+            # 验证融合位置是否合理
+            if np.linalg.norm(fused_pos - reference_kpts[joint_id][:2]) < self.position_threshold:
+                fused_kpts[joint_id][:2] = fused_pos
+                # 使用较高的置信度，但给予YOLO更大权重
+                fused_kpts[joint_id][2] = 0.7 * yolo_conf + 0.3 * op_conf
+        
+        # 应用改进的时间平滑
+        if len(self.history) > 0:
+            prev_kpts = self.history[-1]
+            if self.validate_keypoints(prev_kpts, reference_kpts):
+                alpha = 0.8  # 调整平滑强度
+                for i in range(len(fused_kpts)):
+                    if (prev_kpts[i][2] > 0.5 and fused_kpts[i][2] > 0.5 and
+                        np.linalg.norm(fused_kpts[i][:2] - prev_kpts[i][:2]) < self.position_threshold):
+                        fused_kpts[i][:2] = (alpha * fused_kpts[i][:2] + 
+                                           (1-alpha) * prev_kpts[i][:2])
+        
+        self.history.append(fused_kpts.copy())
+        return fused_kpts
+
+    def get_fusion_info(self):
+        """获取融合状态信息"""
+        if len(self.history) == 0:
+            return {
+                "Average Confidence": "N/A",
+                "Motion Level": "N/A",
+                "Stable Points": "0/17"
+            }
+            
+        latest = self.history[-1]
+        avg_conf = np.mean([kpt[2] for kpt in latest if kpt[2] > 0.5])
+        
+        motion = 0
+        if len(self.history) > 1:
+            prev = self.history[-2]
+            valid_points = [(i, p) for i, p in enumerate(latest) 
+                          if p[2] > 0.5 and prev[i][2] > 0.5]
+            if valid_points:
+                motions = [np.linalg.norm(latest[i][:2] - prev[i][:2]) 
+                          for i, _ in valid_points]
+                motion = np.mean(motions)
+        
+        return {
+            "Average Confidence": f"{avg_conf:.2f}",
+            "Motion Level": f"{motion:.1f}",
+            "Stable Points": f"{sum(1 for kpt in latest if kpt[2] > 0.5)}/17"
+        }
+
 def main():
     """主函数"""
     if USE_CAMERA:
@@ -579,6 +761,10 @@ def main():
     # 初始化骨骼一致性检查器
     global skeleton_checker
     skeleton_checker = SkeletonConsistencyChecker()
+    
+    # 初始化姿态融合器
+    global pose_fusion
+    pose_fusion = PoseFusion()
     
     running = True  # 添加运行状态标志
     
