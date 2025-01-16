@@ -5,20 +5,6 @@ import openpose.pyopenpose as op
 from collections import deque
 import torch
 import time
-import asyncio
-import torch.cuda
-from concurrent.futures import ThreadPoolExecutor
-import gc
-from typing import Optional, Dict
-import weakref
-import numba
-import mmap
-import cProfile
-import io
-import pstats
-from memory_profiler import profile
-import psutil
-import os
 import sys
 
 # 关键点和骨架定义
@@ -332,115 +318,111 @@ def process_frame(frame):
     try:
         start_time = time.time()
         
-        # 初始化所有可能用到的变量
-        yolo_conf = 0.0
-        openpose_conf = 0.0
-        weight = 0.0
-        smoothed_kpts = None
-        analysis_results = []
+        # 创建单个帧副本，避免重复拷贝
+        processed_frame = preprocess_frame(frame.copy())
+        display_frames = {
+            'openpose': processed_frame.copy(),
+            'yolo': processed_frame.copy(),
+            'mixed': processed_frame.copy()
+        }
         
-        # 初始化返回值
-        openpose_frame = frame.copy()
-        yolo_frame = frame.copy()
-        mixed_frame = frame.copy()
-        
-        # 预处理帧
-        processed_frame = preprocess_frame(frame)
+        # 初始化结果字典，使用更简洁的结构
+        results = {
+            'keypoints': {
+                'yolo': None,
+                'openpose': None,
+                'fused': None,
+                'smoothed': None
+            },
+            'info': {
+                'system_status': 'Running',
+                'fps': 0,
+                'keypoint_count': '0/17',
+                'analysis': [],
+                'fusion_data': {},
+                'consistency': []
+            }
+        }
         
         # YOLOv8-pose 检测
         yolo_results = yolo_model(processed_frame)
+        if len(yolo_results) > 0 and len(yolo_results[0].keypoints) > 0:
+            results['keypoints']['yolo'] = yolo_results[0].keypoints.data.cpu().numpy()[0]
+            display_frames['yolo'] = yolo_results[0].plot()
         
         # OpenPose处理
         datum = op.Datum()
         datum.cvInputData = processed_frame
         opWrapper.emplaceAndPop(op.VectorDatum([datum]))
         
-        # 获取关键点数据
-        openpose_kpts = None
         if hasattr(datum, "poseKeypoints") and datum.poseKeypoints is not None:
             if len(datum.poseKeypoints) > 0:
-                openpose_kpts = datum.poseKeypoints[0]
-                openpose_kpts = np.delete(openpose_kpts, -1, axis=0)
+                results['keypoints']['openpose'] = np.delete(datum.poseKeypoints[0], -1, axis=0)
+                display_frames['openpose'] = datum.cvOutputData
         
-        yolo_kpts = None
-        if len(yolo_results) > 0 and len(yolo_results[0].keypoints) > 0:
-            yolo_kpts = yolo_results[0].keypoints.data.cpu().numpy()[0]
+        # 融合和分析过程
+        if results['keypoints']['yolo'] is not None and results['keypoints']['openpose'] is not None:
+            if results['keypoints']['yolo'].shape == results['keypoints']['openpose'].shape:
+                # 一次性处理关键点数据
+                process_keypoints(results, display_frames['mixed'])
         
-        # 计算FPS
-        fps = 1.0 / (time.time() - start_time)
-        
-        # 初始化基本信息
-        info_dict = {
-            "System": "Running",
-            "FPS": f"{fps:.1f}",
-            "YOLO": "N/A",
-            "OpenPose": "N/A",
-            "Fusion": "N/A",
-            "Keypoints": "0/17",
-            "Analysis": []
-        }
-        
-        # 如果两个模型都检测到关键点
-        if openpose_kpts is not None and yolo_kpts is not None:
-            if openpose_kpts.shape == yolo_kpts.shape:
-                openpose_conf = calculate_confidence(openpose_kpts)
-                yolo_conf = calculate_confidence(yolo_kpts)
-                
-                total_conf = openpose_conf + yolo_conf
-                weight = yolo_conf / total_conf if total_conf > 0 else 0.5
-                
-                # 确保混合帧是原始帧的副本
-                mixed_frame = frame.copy()
-                
-                # 融合关键点
-                fused_kpts = pose_fusion.fuse_keypoints(yolo_kpts, openpose_kpts)
-                
-                if fused_kpts is not None:
-                    # 应用平滑
-                    smoothed_kpts = smoother.update(fused_kpts)
-                    
-                    if smoothed_kpts is not None:
-                        # 在混合帧上绘制骨架
-                        draw_skeleton(mixed_frame, smoothed_kpts)
-                        
-                        # 更新信息
-                        fusion_info = pose_fusion.get_fusion_info()
-                        info_dict.update({
-                            "Fusion": fusion_info["Average Confidence"],
-                            "Motion": fusion_info["Motion Level"],
-                            "Keypoints": fusion_info["Stable Points"]
-                        })
-        
-        # 检查骨骼一致性
-        if smoothed_kpts is not None:
-            # 检查骨骼一致性
-            consistency_issues = skeleton_checker.check_consistency(smoothed_kpts)
-            if consistency_issues:
-                info_dict["Consistency"] = consistency_issues
-                
-        # 更新显示帧
-        if hasattr(datum, "cvOutputData"):
-            openpose_frame = datum.cvOutputData
-        if len(yolo_results) > 0:
-            yolo_frame = yolo_results[0].plot()
+        # 更新FPS
+        results['info']['fps'] = f"{1.0 / (time.time() - start_time):.1f}"
         
         # 存储结果用于信息面板显示
-        process_frame.last_results = info_dict
+        process_frame.last_results = results['info']
         
-        if smoothed_kpts is not None:
-            # 更新姿态稳定性分析器
-            posture_stability_analyzer.add_pose(smoothed_kpts)
-            
-            # 分析姿态并更新信息字典
-            analysis_results = analyze_pose(smoothed_kpts)
-            if analysis_results:
-                info_dict["Analysis"] = analysis_results
-                
-        return openpose_frame, yolo_frame, mixed_frame
+        return display_frames['openpose'], display_frames['yolo'], display_frames['mixed']
         
     except Exception as e:
         print(f"处理帧时发生错误: {str(e)}")
         return frame, frame, frame
+
+def process_keypoints(results, mixed_frame):
+    """集中处理关键点相关的所有操作"""
+    # 1. 融合关键点
+    results['keypoints']['fused'] = pose_fusion.fuse_keypoints(
+        results['keypoints']['yolo'],
+        results['keypoints']['openpose']
+    )
+    
+    if results['keypoints']['fused'] is not None:
+        # 2. 平滑处理
+        results['keypoints']['smoothed'] = smoother.update(results['keypoints']['fused'])
+        
+        if results['keypoints']['smoothed'] is not None:
+            # 3. 一次性进行所有分析
+            analyze_keypoints(results, mixed_frame)
+
+def analyze_keypoints(results, mixed_frame):
+    """集中处理所有关键点分析"""
+    smoothed_kpts = results['keypoints']['smoothed']
+    
+    # 1. 绘制骨架
+    draw_skeleton(mixed_frame, smoothed_kpts)
+    
+    # 2. 更新融合信息
+    fusion_info = pose_fusion.get_fusion_info()
+    results['info'].update({
+        'fusion_data': {
+            'confidence': fusion_info["Average Confidence"],
+            'motion': fusion_info["Motion Level"],
+            'keypoint_count': fusion_info["Stable Points"]
+        }
+    })
+    
+    # 3. 检查骨骼一致性
+    consistency_issues = skeleton_checker.check_consistency(smoothed_kpts)
+    if consistency_issues:
+        results['info']['consistency'] = consistency_issues
+    
+    # 4. 更新姿态稳定性
+    posture_stability_analyzer.add_pose(smoothed_kpts)
+    
+    # 5. 分析姿态
+    pose_analysis = analyze_pose(smoothed_kpts)
+    if pose_analysis:
+        results['info']['analysis'] = pose_analysis
 
 def draw_skeleton(frame, keypoints, thickness=2):
     """改进的骨架绘制函数"""
