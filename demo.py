@@ -6,6 +6,7 @@ from collections import deque
 import torch
 import time
 import sys
+import traceback
 
 # 关键点和骨架定义
 OPENPOSE_PAIRS = [
@@ -44,7 +45,7 @@ KEYPOINT_NAMES = {
 }
 
 # 视频路径配置
-VIDEO_PATH = "video/output_video.mp4"  # 视频文件路径
+VIDEO_PATH = "video/test_1.mp4"  # 视频文件路径
 USE_CAMERA = False  # 设置为 False 使用视频文件
 CAMERA_ID = 0     # 不使用摄像头，此项可忽略
 
@@ -339,7 +340,7 @@ def process_frame(frame):
             'mixed': processed_frame.copy()
         }
         
-        # 初始化结果字典，使用更简洁的结构
+        # 初始化结果字典
         results = {
             'keypoints': {
                 'yolo': None,
@@ -357,38 +358,42 @@ def process_frame(frame):
             }
         }
         
-        # YOLOv8-pose 检测
-        yolo_results = yolo_model(processed_frame)
-        if len(yolo_results) > 0 and len(yolo_results[0].keypoints) > 0:
-            results['keypoints']['yolo'] = yolo_results[0].keypoints.data.cpu().numpy()[0]
-            display_frames['yolo'] = yolo_results[0].plot()
-        
-        # OpenPose处理
-        datum = op.Datum()
-        datum.cvInputData = processed_frame
-        opWrapper.emplaceAndPop(op.VectorDatum([datum]))
-        
-        if hasattr(datum, "poseKeypoints") and datum.poseKeypoints is not None:
-            if len(datum.poseKeypoints) > 0:
-                results['keypoints']['openpose'] = np.delete(datum.poseKeypoints[0], -1, axis=0)
-                display_frames['openpose'] = datum.cvOutputData
-        
-        # 融合和分析过程
-        if results['keypoints']['yolo'] is not None and results['keypoints']['openpose'] is not None:
-            if results['keypoints']['yolo'].shape == results['keypoints']['openpose'].shape:
-                # 一次性处理关键点数据
+        try:
+            # YOLOv8-pose 检测
+            yolo_results = yolo_model(processed_frame)
+            if len(yolo_results) > 0 and len(yolo_results[0].keypoints) > 0:
+                results['keypoints']['yolo'] = yolo_results[0].keypoints.data.cpu().numpy()[0]
+                display_frames['yolo'] = yolo_results[0].plot()
+            
+            # OpenPose处理
+            datum = op.Datum()
+            datum.cvInputData = processed_frame
+            opWrapper.emplaceAndPop(op.VectorDatum([datum]))
+            
+            if hasattr(datum, "poseKeypoints") and datum.poseKeypoints is not None:
+                if len(datum.poseKeypoints) > 0:
+                    results['keypoints']['openpose'] = np.delete(datum.poseKeypoints[0], -1, axis=0)
+                    display_frames['openpose'] = datum.cvOutputData
+            
+            # 融合和分析过程
+            if (results['keypoints']['yolo'] is not None and 
+                results['keypoints']['openpose'] is not None and
+                results['keypoints']['yolo'].shape == results['keypoints']['openpose'].shape):
                 process_keypoints(results, display_frames['mixed'])
+            
+        except Exception as e:
+            print(f"处理关键点时发生错误: {str(e)}")
+            traceback.print_exc()  # 打印详细的错误堆栈
         
         # 更新FPS
         results['info']['fps'] = f"{1.0 / (time.time() - start_time):.1f}"
-        
-        # 存储结果用于信息面板显示
         process_frame.last_results = results['info']
         
         return display_frames['openpose'], display_frames['yolo'], display_frames['mixed']
         
     except Exception as e:
         print(f"处理帧时发生错误: {str(e)}")
+        traceback.print_exc()
         return frame, frame, frame
 
 def process_keypoints(results, mixed_frame):
@@ -430,6 +435,27 @@ def process_keypoints(results, mixed_frame):
         if results['keypoints']['smoothed'] is not None:
             # 4. 一次性进行所有分析
             analyze_keypoints(results, mixed_frame)
+
+    # 添加运动连续性检查
+    if results['keypoints']['fused'] is not None:
+        results['keypoints']['fused'] = motion_checker.check_motion(
+            results['keypoints']['fused']
+        )
+
+    if results['keypoints']['fused'] is not None:
+        # 应用轨迹分析
+        results['keypoints']['fused'] = trajectory_analyzer.analyze_trajectory(
+            results['keypoints']['fused']
+        )
+        
+        # 更新检测器性能
+        pose_fusion.update_performance(results['keypoints']['yolo'], 'yolo')
+        pose_fusion.update_performance(results['keypoints']['openpose'], 'openpose')
+        
+        # 验证姿态一致性
+        results['keypoints']['fused'] = pose_validator.validate_pose(
+            results['keypoints']['fused']
+        )
 
 def analyze_keypoints(results, mixed_frame):
     """集中处理所有关键点分析"""
@@ -662,24 +688,59 @@ class PoseFusion:
         self.position_threshold = 45     # 增加位置阈值
         self.history = deque(maxlen=5)    # 保持5帧历史记录
         
+        # 添加动态权重调整参数
+        self.performance_history = {
+            'yolo': deque(maxlen=30),
+            'openpose': deque(maxlen=30)
+        }
+        
     def validate_keypoints(self, keypoints, reference_points):
-        """验证关键点是否在合理范围内"""
+        """增强的关键点验证"""
         if keypoints is None or reference_points is None:
             return False
-            
-        # 计算参考点的中心位置（使用躯干关键点）
-        ref_points = [5, 6, 11, 12]  # 肩部和髋部关键点
-        ref_center = np.mean([reference_points[i][:2] for i in ref_points 
-                            if reference_points[i][2] > 0.5], axis=0)
         
-        # 计算待验证点的中心位置
-        kpt_center = np.mean([keypoints[i][:2] for i in ref_points 
-                            if keypoints[i][2] > 0.5], axis=0)
-        
-        # 如果两个中心点距离过大，认为是无效检测
-        if np.linalg.norm(ref_center - kpt_center) > self.position_threshold:
+        # 1. 检查躯干关键点的有效性
+        trunk_points = [5, 6, 11, 12]  # 肩部和髋部关键点
+        trunk_valid = all(keypoints[i][2] > 0.6 for i in trunk_points)
+        if not trunk_valid:
             return False
-            
+        
+        # 2. 计算身体比例
+        def get_body_proportions(kpts):
+            proportions = {}
+            if all(kpts[i][2] > 0.5 for i in [5, 6]):
+                proportions['shoulder_width'] = np.linalg.norm(kpts[5][:2] - kpts[6][:2])
+            if all(kpts[i][2] > 0.5 for i in [11, 12]):
+                proportions['hip_width'] = np.linalg.norm(kpts[11][:2] - kpts[12][:2])
+            if all(kpts[i][2] > 0.5 for i in [5, 11]):
+                proportions['torso_height'] = np.linalg.norm(kpts[5][:2] - kpts[11][:2])
+            return proportions
+        
+        ref_proportions = get_body_proportions(reference_points)
+        test_proportions = get_body_proportions(keypoints)
+        
+        # 3. 比较身体比例
+        for key in ref_proportions:
+            if key in test_proportions:
+                ratio = test_proportions[key] / ref_proportions[key]
+                if not (0.7 <= ratio <= 1.3):
+                    return False
+        
+        # 4. 检查关键点的相对位置关系
+        def check_relative_positions(kpts):
+            # 检查肩部在头部下方
+            if all(kpts[i][2] > 0.5 for i in [0, 5, 6]):
+                if not (kpts[5][1] > kpts[0][1] and kpts[6][1] > kpts[0][1]):
+                    return False
+            # 检查髋部在肩部下方
+            if all(kpts[i][2] > 0.5 for i in [5, 6, 11, 12]):
+                if not (kpts[11][1] > kpts[5][1] and kpts[12][1] > kpts[6][1]):
+                    return False
+            return True
+        
+        if not check_relative_positions(keypoints):
+            return False
+        
         return True
 
     def fuse_keypoints(self, yolo_kpts, op_kpts):
@@ -769,6 +830,12 @@ class PoseFusion:
         # 在融合后应用解剖学约束
         fused_kpts = apply_anatomical_constraints(fused_kpts)
         
+        # 应用先验知识检查
+        confidence_factor = pose_prior.check_pose_validity(fused_kpts)
+        if confidence_factor < 1.0:
+            for i in range(len(fused_kpts)):
+                fused_kpts[i][2] *= confidence_factor
+        
         return fused_kpts
 
     def get_fusion_info(self):
@@ -798,6 +865,39 @@ class PoseFusion:
             "Motion Level": f"{motion:.1f}",
             "Stable Points": f"{sum(1 for kpt in latest if kpt[2] > 0.5)}/17"
         }
+
+    def update_weights(self, yolo_kpts, op_kpts, joint_id):
+        """动态调整融合权重"""
+        base_weights = self.joint_weights.get(
+            joint_id, 
+            {'yolo': 0.7, 'openpose': 0.3}
+        )
+        
+        # 计算历史表现
+        if len(self.performance_history['yolo']) > 0:
+            yolo_stability = np.mean(self.performance_history['yolo'])
+            op_stability = np.mean(self.performance_history['openpose'])
+            
+            # 根据历史表现调整权重
+            total_stability = yolo_stability + op_stability
+            if total_stability > 0:
+                yolo_weight = (base_weights['yolo'] * 0.7 + 
+                             (yolo_stability / total_stability) * 0.3)
+                op_weight = 1 - yolo_weight
+                return yolo_weight, op_weight
+        
+        return base_weights['yolo'], base_weights['openpose']
+    
+    def update_performance(self, keypoints, source):
+        """更新检测器性能历史"""
+        if keypoints is None:
+            return
+            
+        # 计算关键点稳定性得分
+        valid_confs = [kpt[2] for kpt in keypoints if kpt[2] > 0.5]
+        if valid_confs:
+            stability = np.mean(valid_confs)
+            self.performance_history[source].append(stability)
 
 class PostureStabilityAnalyzer:
     def __init__(self, window_size=30):  # 使用30帧窗口
@@ -934,6 +1034,245 @@ class PostureStabilityAnalyzer:
                 
         return warnings
 
+class PosePriorKnowledge:
+    def __init__(self):
+        # 定义常见姿态的关键点角度范围
+        self.pose_constraints = {
+            'standing': {
+                'spine_angle': (160, 200),  # 脊柱应该接近垂直
+                'knee_angle': (160, 180),   # 站立时膝盖应该接近伸直
+                'hip_width_ratio': (0.8, 1.2)  # 髋部宽度比例
+            },
+            'walking': {
+                'step_length': (0.5, 1.5),  # 相对于身高的步长比例
+                'arm_swing': (30, 60),      # 手臂摆动角度范围
+                'leg_lift': (10, 45)        # 腿部抬起角度范围
+            }
+        }
+        
+        # 定义关键点对称性约束
+        self.symmetry_pairs = [
+            ((5,7), (6,8)),   # 左右上臂
+            ((7,9), (8,10)),  # 左右前臂
+            ((11,13), (12,14)), # 左右大腿
+            ((13,15), (14,16))  # 左右小腿
+        ]
+        
+    def check_pose_validity(self, keypoints):
+        """检查姿态是否符合先验知识"""
+        if keypoints is None:
+            return 1.0  # 返回置信度调整因子
+            
+        confidence_factor = 1.0
+        
+        # 检查对称性
+        for (left_pair, right_pair) in self.symmetry_pairs:
+            left_length = np.linalg.norm(keypoints[left_pair[0]][:2] - keypoints[left_pair[1]][:2])
+            right_length = np.linalg.norm(keypoints[right_pair[0]][:2] - keypoints[right_pair[1]][:2])
+            
+            if left_length > 0 and right_length > 0:
+                ratio = min(left_length, right_length) / max(left_length, right_length)
+                if ratio < 0.7:  # 如果不对称性过大
+                    confidence_factor *= 0.8
+        
+        # 检查脊柱角度
+        if all(keypoints[i][2] > 0.5 for i in [5, 6, 11, 12]):
+            shoulder_mid = (keypoints[5][:2] + keypoints[6][:2]) / 2
+            hip_mid = (keypoints[11][:2] + keypoints[12][:2]) / 2
+            spine_angle = calculate_angle(shoulder_mid, hip_mid)
+            
+            # 检查是否在合理范围内
+            if not (160 <= abs(spine_angle) <= 200):
+                confidence_factor *= 0.9
+        
+        return confidence_factor
+
+class MotionContinuityChecker:
+    def __init__(self, window_size=5):
+        self.window_size = window_size
+        self.history = deque(maxlen=window_size)
+        self.velocity_threshold = 50  # 最大允许速度
+        self.acceleration_threshold = 25  # 最大允许加速度
+        
+    def check_motion(self, keypoints):
+        """检查运动的连续性"""
+        if keypoints is None:
+            return None
+            
+        self.history.append(keypoints)
+        if len(self.history) < 3:
+            return keypoints
+            
+        adjusted_keypoints = keypoints.copy()
+        
+        # 修改这部分代码，使用列表索引而不是切片
+        for i in range(len(keypoints)):
+            if keypoints[i][2] < 0.5:
+                continue
+                
+            # 获取最近三帧的位置
+            positions = []
+            for frame_idx in range(1, 4):  # 获取最近3帧
+                if len(self.history) >= frame_idx:
+                    frame = self.history[-frame_idx]
+                    if frame[i][2] > 0.5:
+                        positions.append(frame[i][:2])
+            
+            if len(positions) < 3:
+                continue
+                
+            # 计算速度和加速度
+            positions = np.array(positions)
+            v1 = np.linalg.norm(positions[0] - positions[1])
+            v2 = np.linalg.norm(positions[1] - positions[2])
+            acceleration = abs(v1 - v2)
+            
+            # 如果运动不连续，调整置信度
+            if v1 > self.velocity_threshold or acceleration > self.acceleration_threshold:
+                adjusted_keypoints[i][2] *= 0.7
+                # 使用插值来平滑运动
+                adjusted_keypoints[i][:2] = (positions[1] + positions[0]) / 2
+                
+        return adjusted_keypoints
+
+class KeypointTrajectoryAnalyzer:
+    def __init__(self, window_size=30):
+        self.window_size = window_size
+        self.trajectories = {i: deque(maxlen=window_size) for i in range(17)}
+        self.velocity_history = {i: deque(maxlen=window_size-1) for i in range(17)}
+        
+    def analyze_trajectory(self, keypoints):
+        """分析关键点轨迹的合理性"""
+        if keypoints is None:
+            return keypoints
+            
+        adjusted_keypoints = keypoints.copy()
+        
+        # 更新轨迹
+        for i in range(len(keypoints)):
+            if keypoints[i][2] > 0.5:
+                self.trajectories[i].append(keypoints[i][:2])
+                
+                if len(self.trajectories[i]) > 1:
+                    velocity = np.linalg.norm(
+                        self.trajectories[i][-1] - self.trajectories[i][-2]
+                    )
+                    self.velocity_history[i].append(velocity)
+        
+        # 分析轨迹
+        for i in range(len(keypoints)):
+            if len(self.trajectories[i]) < 3:
+                continue
+                
+            # 1. 检查速度一致性
+            if len(self.velocity_history[i]) > 2:
+                mean_velocity = np.mean(self.velocity_history[i])
+                std_velocity = np.std(self.velocity_history[i])
+                current_velocity = self.velocity_history[i][-1]
+                
+                if abs(current_velocity - mean_velocity) > 2 * std_velocity:
+                    adjusted_keypoints[i][2] *= 0.8
+            
+            # 2. 检查轨迹平滑度
+            if len(self.trajectories[i]) > 3:
+                points = np.array(list(self.trajectories[i]))
+                # 计算曲线拟合误差
+                try:
+                    x = np.arange(len(points))
+                    coeffs_x = np.polyfit(x, points[:,0], 2)
+                    coeffs_y = np.polyfit(x, points[:,1], 2)
+                    
+                    fitted_x = np.polyval(coeffs_x, x)
+                    fitted_y = np.polyval(coeffs_y, x)
+                    
+                    error = np.mean(np.sqrt(
+                        (fitted_x - points[:,0])**2 + 
+                        (fitted_y - points[:,1])**2
+                    ))
+                    
+                    if error > 10:  # 轨迹不平滑
+                        adjusted_keypoints[i][2] *= 0.9
+                except:
+                    pass
+            
+            # 3. 检查加速度变化
+            if len(self.velocity_history[i]) > 2:
+                accelerations = np.diff(list(self.velocity_history[i]))
+                if np.max(np.abs(accelerations)) > 30:  # 加速度突变
+                    adjusted_keypoints[i][2] *= 0.85
+        
+        return adjusted_keypoints
+
+class PoseConsistencyValidator:
+    def __init__(self):
+        self.angle_constraints = {
+            # 肘部角度范围
+            'elbow': {
+                'left': (30, 180),
+                'right': (30, 180)
+            },
+            # 膝盖角度范围
+            'knee': {
+                'left': (30, 180),
+                'right': (30, 180)
+            },
+            # 髋部角度范围
+            'hip': {
+                'left': (45, 180),
+                'right': (45, 180)
+            }
+        }
+        
+    def validate_pose(self, keypoints):
+        """验证姿态的生理学合理性"""
+        if keypoints is None:
+            return keypoints
+            
+        adjusted_keypoints = keypoints.copy()
+        
+        # 检查肘部角度
+        def check_elbow_angle(side):
+            if side == 'left':
+                pts = [5, 7, 9]  # 左肩、左肘、左腕
+            else:
+                pts = [6, 8, 10]  # 右肩、右肘、右腕
+                
+            if all(keypoints[i][2] > 0.5 for i in pts):
+                angle = calculate_angle(
+                    keypoints[pts[0]][:2],
+                    keypoints[pts[1]][:2],
+                    keypoints[pts[2]][:2]
+                )
+                constraints = self.angle_constraints['elbow'][side]
+                if not constraints[0] <= angle <= constraints[1]:
+                    adjusted_keypoints[pts[1]][2] *= 0.8
+                    adjusted_keypoints[pts[2]][2] *= 0.8
+        
+        # 检查膝盖角度
+        def check_knee_angle(side):
+            if side == 'left':
+                pts = [11, 13, 15]  # 左髋、左膝、左踝
+            else:
+                pts = [12, 14, 16]  # 右髋、右膝、右踝
+                
+            if all(keypoints[i][2] > 0.5 for i in pts):
+                angle = calculate_angle(
+                    keypoints[pts[0]][:2],
+                    keypoints[pts[1]][:2],
+                    keypoints[pts[2]][:2]
+                )
+                constraints = self.angle_constraints['knee'][side]
+                if not constraints[0] <= angle <= constraints[1]:
+                    adjusted_keypoints[pts[1]][2] *= 0.8
+                    adjusted_keypoints[pts[2]][2] *= 0.8
+        
+        # 应用所有检查
+        for side in ['left', 'right']:
+            check_elbow_angle(side)
+            check_knee_angle(side)
+        
+        return adjusted_keypoints
+
 def main():
     """主函数"""
     if USE_CAMERA:
@@ -959,6 +1298,21 @@ def main():
     # 初始化姿态稳定性分析器
     global posture_stability_analyzer
     posture_stability_analyzer = PostureStabilityAnalyzer()
+    
+    # 初始化先验知识检查器
+    global pose_prior
+    pose_prior = PosePriorKnowledge()
+    
+    # 初始化运动连续性检查器
+    global motion_checker
+    motion_checker = MotionContinuityChecker()
+    
+    # 初始化新组件
+    global trajectory_analyzer
+    trajectory_analyzer = KeypointTrajectoryAnalyzer()
+    
+    global pose_validator
+    pose_validator = PoseConsistencyValidator()
     
     running = True  # 添加运行状态标志
     
