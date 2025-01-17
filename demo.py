@@ -206,9 +206,10 @@ class KeypointSmoother:
     def __init__(self, window_size=5):
         self.window_size = window_size
         self.history = []
+        self.confidence_threshold = 0.5
         
     def update(self, keypoints):
-        """使用滑动窗口平均进行平滑处理"""
+        """改进的平滑处理"""
         if keypoints is None:
             return None
             
@@ -216,14 +217,26 @@ class KeypointSmoother:
         if len(self.history) > self.window_size:
             self.history.pop(0)
             
-        # 计算加权平均，最近的帧权重更大
-        weights = np.linspace(0.5, 1.0, len(self.history))
-        weights = weights / weights.sum()
-        
+        # 使用卡尔曼滤波进行平滑
         smoothed = np.zeros_like(keypoints)
-        for i, kpts in enumerate(self.history):
-            smoothed += kpts * weights[i]
+        for i in range(len(keypoints)):
+            valid_points = []
+            valid_confs = []
             
+            for hist_kpts in self.history:
+                if hist_kpts[i][2] > self.confidence_threshold:
+                    valid_points.append(hist_kpts[i][:2])
+                    valid_confs.append(hist_kpts[i][2])
+                    
+            if valid_points:
+                # 根据置信度加权平均
+                weights = np.array(valid_confs)
+                weights = weights / weights.sum()
+                smoothed[i][:2] = np.average(valid_points, weights=weights, axis=0)
+                smoothed[i][2] = keypoints[i][2]  # 保持原始置信度
+            else:
+                smoothed[i] = keypoints[i]
+                
         return smoothed
 
 def calculate_angle(p1, p2, p3=None):
@@ -379,7 +392,23 @@ def process_frame(frame):
         return frame, frame, frame
 
 def process_keypoints(results, mixed_frame):
-    """集中处理关键点相关的所有操作"""
+    """改进的关键点处理函数"""
+    # 添加时序一致性检查
+    def check_temporal_consistency(current_kpts, prev_kpts, max_speed=50):
+        if prev_kpts is None:
+            return current_kpts
+            
+        consistent_kpts = current_kpts.copy()
+        for i in range(len(current_kpts)):
+            if (current_kpts[i][2] > 0.5 and prev_kpts[i][2] > 0.5):
+                displacement = np.linalg.norm(current_kpts[i][:2] - prev_kpts[i][:2])
+                if displacement > max_speed:
+                    # 如果位移过大，使用插值或降低置信度
+                    consistent_kpts[i][:2] = (current_kpts[i][:2] + prev_kpts[i][:2]) / 2
+                    consistent_kpts[i][2] *= 0.8
+                    
+        return consistent_kpts
+
     # 1. 融合关键点
     results['keypoints']['fused'] = pose_fusion.fuse_keypoints(
         results['keypoints']['yolo'],
@@ -387,11 +416,19 @@ def process_keypoints(results, mixed_frame):
     )
     
     if results['keypoints']['fused'] is not None:
-        # 2. 平滑处理
+        # 2. 应用时序一致性检查
+        if hasattr(process_keypoints, 'prev_keypoints'):
+            results['keypoints']['fused'] = check_temporal_consistency(
+                results['keypoints']['fused'],
+                process_keypoints.prev_keypoints
+            )
+        process_keypoints.prev_keypoints = results['keypoints']['fused'].copy()
+        
+        # 3. 平滑处理
         results['keypoints']['smoothed'] = smoother.update(results['keypoints']['fused'])
         
         if results['keypoints']['smoothed'] is not None:
-            # 3. 一次性进行所有分析
+            # 4. 一次性进行所有分析
             analyze_keypoints(results, mixed_frame)
 
 def analyze_keypoints(results, mixed_frame):
@@ -604,25 +641,19 @@ def create_display_window(openpose_frame, yolo_frame, mixed_frame, info_dict):
 
 class PoseFusion:
     def __init__(self):
-        # 微调权重配置
+        # 更新权重配置，根据不同关键点的特性调整
         self.joint_weights = {
-            # 躯干核心关键点
-            5: {'yolo': 0.85, 'openpose': 0.15},  # 左肩
-            6: {'yolo': 0.85, 'openpose': 0.15},  # 右肩
-            11: {'yolo': 0.85, 'openpose': 0.15}, # 左髋
-            12: {'yolo': 0.85, 'openpose': 0.15}, # 右髋
+            # 躯干核心关键点 - YOLO在躯干检测上更稳定
+            5: {'yolo': 0.9, 'openpose': 0.1},   # 左肩
+            6: {'yolo': 0.9, 'openpose': 0.1},   # 右肩
+            11: {'yolo': 0.9, 'openpose': 0.1},  # 左髋
+            12: {'yolo': 0.9, 'openpose': 0.1},  # 右髋
             
-            # 上肢关键点
-            7: {'yolo': 0.8, 'openpose': 0.2},   # 左肘
-            8: {'yolo': 0.8, 'openpose': 0.2},   # 右肘
-            9: {'yolo': 0.8, 'openpose': 0.2},   # 左腕
-            10: {'yolo': 0.8, 'openpose': 0.2},  # 右腕
-            
-            # 下肢关键点
-            13: {'yolo': 0.8, 'openpose': 0.2},  # 左膝
-            14: {'yolo': 0.8, 'openpose': 0.2},  # 右膝
-            15: {'yolo': 0.8, 'openpose': 0.2},  # 左踝
-            16: {'yolo': 0.8, 'openpose': 0.2},  # 右踝
+            # 四肢关键点 - OpenPose在四肢末端检测上较好
+            9: {'yolo': 0.6, 'openpose': 0.4},   # 左腕
+            10: {'yolo': 0.6, 'openpose': 0.4},  # 右腕
+            15: {'yolo': 0.6, 'openpose': 0.4},  # 左踝
+            16: {'yolo': 0.6, 'openpose': 0.4},  # 右踝
         }
         
         # 调整参数
@@ -713,6 +744,31 @@ class PoseFusion:
                                            (1-alpha) * prev_kpts[i][:2])
         
         self.history.append(fused_kpts.copy())
+        
+        # 添加解剖学约束
+        def apply_anatomical_constraints(kpts):
+            # 检查骨骼长度约束
+            def check_bone_length(p1_idx, p2_idx, min_ratio=0.4, max_ratio=2.5):
+                if kpts[p1_idx][2] > 0.5 and kpts[p2_idx][2] > 0.5:
+                    length = np.linalg.norm(kpts[p1_idx][:2] - kpts[p2_idx][:2])
+                    # 使用肩宽作为参考
+                    shoulder_width = np.linalg.norm(kpts[5][:2] - kpts[6][:2])
+                    ratio = length / shoulder_width
+                    return min_ratio <= ratio <= max_ratio
+                return True
+
+            # 应用解剖学约束
+            for i, j in [(5,7), (7,9), (6,8), (8,10),    # 手臂
+                        (11,13), (13,15), (12,14), (14,16)]: # 腿部
+                if not check_bone_length(i, j):
+                    # 如果违反约束，降低该点的置信度
+                    kpts[j][2] *= 0.5
+            
+            return kpts
+
+        # 在融合后应用解剖学约束
+        fused_kpts = apply_anatomical_constraints(fused_kpts)
+        
         return fused_kpts
 
     def get_fusion_info(self):
