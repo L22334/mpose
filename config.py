@@ -2,7 +2,7 @@
 VIDEO_CONFIG = {
     'USE_CAMERA': False,
     'CAMERA_ID': 0,
-    'VIDEO_PATH': "video/output_video.mp4",
+    'VIDEO_PATH': "video/test_1.mp4",
     'FRAME_WIDTH': 1920,
     'FRAME_HEIGHT': 1080,
     'TARGET_FPS': 30
@@ -24,7 +24,15 @@ ANALYZER_CONFIG = {
     'STABILITY_WINDOW_SIZE': 30,
     'TRAJECTORY_WINDOW_SIZE': 30,
     'MIN_CONFIDENCE': 0.5,
-    'MAX_DETECTION_AGE': 1.0  # 秒
+    'MAX_DETECTION_AGE': 1.0,  # 秒
+    'POSE_CLASSIFICATION': {
+        'VERTICAL_SPINE_THRESHOLD': 15,
+        'BEND_ANGLE_THRESHOLD': 45,
+        'TURN_ANGLE_THRESHOLD': 30,
+        'SHOULDER_ANGLE_THRESHOLD': 60,
+        'KNEE_ANGLE_THRESHOLD': 150,
+        'SQUAT_ANGLE_THRESHOLD': 120,
+    }
 }
 
 # 显示配置

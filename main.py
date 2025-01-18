@@ -16,6 +16,7 @@ from src.analyzers.stability import PostureStabilityAnalyzer
 from src.analyzers.consistency import SkeletonConsistencyChecker
 from src.analyzers.trajectory import KeypointTrajectoryAnalyzer
 from src.analyzers.prior_knowledge import PosePriorKnowledge
+from src.analyzers.pose_classifier import PoseClassifier
 from src.utils.visualization import create_display_window
 import os
 from src.utils.logger import setup_logger
@@ -38,6 +39,7 @@ class PoseDetectionSystem:
                 ANALYZER_CONFIG['TRAJECTORY_WINDOW_SIZE']
             )
             self.pose_prior = PosePriorKnowledge()
+            self.pose_classifier = PoseClassifier()
             
             # 存储最后的处理结果
             self.last_results = None
@@ -142,12 +144,20 @@ class PoseDetectionSystem:
                         # 分析姿态
                         pose_analysis = self.analyzer.analyze_pose(smoothed_keypoints)
                         
+                        # 在现有分析之后添加
+                        pose_classification = self.pose_classifier.classify_pose(smoothed_keypoints)
+                        
                         # 更新结果信息
                         self.last_results = {
                             'fps': f"{1.0 / (time.time() - start_time):.1f}",
                             'analysis': pose_analysis,
                             'consistency': consistency_issues,
-                            'stability': stability_results['warnings']
+                            'stability': stability_results['warnings'],
+                            'pose_class': {
+                                'posture': pose_classification['posture'],
+                                'arms': pose_classification['arms'],
+                                'legs': pose_classification['legs']
+                            }
                         }
             
             # 更新性能指标

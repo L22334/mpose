@@ -51,76 +51,119 @@ def draw_skeleton(frame, keypoints, thickness=2):
 
 def create_display_window(openpose_frame, yolo_frame, mixed_frame, info_dict):
     """创建显示窗口"""
-    height, width = openpose_frame.shape[:2]
+    frame_height, frame_width = openpose_frame.shape[:2]
+    
+    # 所有窗口使用相同的尺寸
+    window_width = frame_width
+    window_height = frame_height
+    
+    # 创建2x2布局的显示画面
+    display_width = window_width * 2
+    display_height = window_height * 2
+    
+    # 创建黑色背景
+    display = np.zeros((display_height, display_width, 3), dtype=np.uint8)
+    
+    # 调整所有帧的大小为统一尺寸
+    openpose_resized = cv2.resize(openpose_frame, (window_width, window_height))
+    yolo_resized = cv2.resize(yolo_frame, (window_width, window_height))
+    mixed_resized = cv2.resize(mixed_frame, (window_width, window_height))
     
     # 创建信息面板
-    info_panel = create_info_panel(height, width)
+    info_panel = create_info_panel(window_height, window_width)
     add_info_to_panel(info_panel, info_dict)
     
-    # 创建上下两个部分
-    top_row = np.hstack((openpose_frame, yolo_frame))
-    bottom_row = np.hstack((mixed_frame, info_panel))
+    # 按2x2网格放置四个窗口
+    display[0:window_height, 0:window_width] = openpose_resized                    # 左上
+    display[0:window_height, window_width:] = yolo_resized                         # 右上
+    display[window_height:, 0:window_width] = mixed_resized                        # 左下
+    display[window_height:, window_width:] = info_panel                            # 右下
     
-    # 合并成最终显示
-    return np.vstack((top_row, bottom_row))
+    return display
 
 def create_info_panel(height, width):
-    """创建信息面板"""
+    """Create info panel"""
     panel = np.zeros((height, width, 3), dtype=np.uint8)
-    panel.fill(20)
     
-    gradient = np.linspace(0, 50, width, dtype=np.uint8)
-    for i in range(3):
-        panel[:, :, i] = gradient
+    # 纯黑背景
+    panel.fill(0)
     
-    cv2.rectangle(panel, (0, 0), (width, 150), (30, 30, 30), -1)
-    cv2.putText(panel, "System Information", 
-                (40, 100), cv2.FONT_HERSHEY_DUPLEX,
-                3.5, (0, 255, 0), 5)
-    cv2.line(panel, (40, 130), (width-40, 130), 
-             (0, 255, 0), 5)
+    # Add title area with dark background
+    title_height = 80  # 增加标题高度
+    cv2.rectangle(panel, (0, 0), (width, title_height), (20, 20, 20), -1)
+    cv2.putText(panel, "POSE DETECTION", 
+                (width//2 - 200, title_height-20), cv2.FONT_HERSHEY_DUPLEX,
+                2.0, (0, 255, 0), 3)  # 增大标题字体
     
     return panel
 
 def add_info_to_panel(panel, info_dict):
-    """在信息面板上添加文本"""
-    y_offset = 250
+    """Add text to info panel"""
+    if not info_dict:
+        return
+        
+    height, width = panel.shape[:2]
+    y_offset = 130  # 增加起始位置
+    left_margin = 40  # 增加左边距
+    line_spacing = 80  # 增加行间距
     
-    for key, value in info_dict.items():
-        if isinstance(value, list):
-            for item in value:
-                text = f"{item}" if key == "Analysis" else f"{key}: {item}"
-                text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_DUPLEX, 2.8, 4)[0]
-                
-                cv2.rectangle(panel, 
-                            (50, y_offset-60), 
-                            (50 + text_size[0] + 20, y_offset+10),
-                            (50, 50, 50), -1)
-                
-                cv2.putText(panel, text,
-                           (53, y_offset), cv2.FONT_HERSHEY_DUPLEX,
-                           2.8, (0, 100, 0), 4)
-                
-                cv2.putText(panel, text,
-                           (50, y_offset), cv2.FONT_HERSHEY_DUPLEX,
-                           2.8, (0, 255, 0), 4)
-                
-                y_offset += 120
-        else:
-            text = f"{key}: {value}"
-            text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_DUPLEX, 2.8, 4)[0]
-            
-            cv2.rectangle(panel, 
-                        (50, y_offset-60), 
-                        (50 + text_size[0] + 20, y_offset+10),
-                        (50, 50, 50), -1)
-            
-            cv2.putText(panel, text,
-                       (53, y_offset), cv2.FONT_HERSHEY_DUPLEX,
-                       2.8, (0, 100, 0), 4)
-            
-            cv2.putText(panel, text,
-                       (50, y_offset), cv2.FONT_HERSHEY_DUPLEX,
-                       2.8, (0, 255, 0), 4)
-            
-            y_offset += 120 
+    # Add FPS
+    if 'fps' in info_dict:
+        cv2.putText(panel, f"FPS: {info_dict['fps']}", 
+                   (left_margin, y_offset), cv2.FONT_HERSHEY_SIMPLEX,
+                   2.0, (0, 255, 0), 2)
+        y_offset += line_spacing
+    
+    # Add pose classification results
+    if 'pose_class' in info_dict:
+        pose_class = info_dict['pose_class']
+        
+        # Posture
+        cv2.putText(panel, "POSTURE:", 
+                   (left_margin, y_offset), cv2.FONT_HERSHEY_SIMPLEX,
+                   2.0, (0, 255, 255), 2)
+        y_offset += line_spacing - 25
+        
+        posture_text = pose_class['posture'].upper()
+        cv2.putText(panel, f">{posture_text}", 
+                   (left_margin + 30, y_offset), cv2.FONT_HERSHEY_SIMPLEX,
+                   1.8, (0, 255, 0), 2)
+        y_offset += line_spacing
+        
+        # Arms
+        cv2.putText(panel, "ARMS:", 
+                   (left_margin, y_offset), cv2.FONT_HERSHEY_SIMPLEX,
+                   2.0, (0, 255, 255), 2)
+        y_offset += line_spacing - 25
+        
+        arms_text = {
+            'both_arms_down': 'BOTH DOWN',
+            'one_arm_up': 'ONE UP',
+            'both_arms_up': 'BOTH UP',
+            'unknown': 'UNKNOWN'
+        }.get(pose_class['arms'], pose_class['arms'])
+        
+        cv2.putText(panel, f">{arms_text}", 
+                   (left_margin + 30, y_offset), cv2.FONT_HERSHEY_SIMPLEX,
+                   1.8, (0, 255, 0), 2)
+        y_offset += line_spacing
+        
+        # Legs
+        cv2.putText(panel, "LEGS:", 
+                   (left_margin, y_offset), cv2.FONT_HERSHEY_SIMPLEX,
+                   2.0, (0, 255, 255), 2)
+        y_offset += line_spacing - 25
+        
+        legs_text = {
+            'sitting': 'SITTING',
+            'standing_straight': 'STANDING',
+            'standing_one_leg': 'ONE LEG',
+            'both_legs_bent': 'BOTH BENT',
+            'one_leg_bent': 'ONE BENT',
+            'kneeling_or_squatting': 'SQUAT',
+            'unknown': 'UNKNOWN'
+        }.get(pose_class['legs'], pose_class['legs'])
+        
+        cv2.putText(panel, f">{legs_text}", 
+                   (left_margin + 30, y_offset), cv2.FONT_HERSHEY_SIMPLEX,
+                   1.8, (0, 255, 0), 2) 
