@@ -2,7 +2,12 @@ import cv2
 import sys
 import time
 import torch
-from config import *
+from config import (
+    VIDEO_CONFIG, 
+    OPENPOSE_CONFIG,
+    ANALYZER_CONFIG,
+    DISPLAY_CONFIG
+)
 from src.core.pose_detector import PoseDetector
 from src.core.pose_analyzer import PoseAnalyzer
 from src.processors.keypoint_smoother import KeypointSmoother
@@ -14,6 +19,7 @@ from src.analyzers.prior_knowledge import PosePriorKnowledge
 from src.utils.visualization import create_display_window
 import os
 from src.utils.logger import setup_logger
+from collections import deque
 
 class PoseDetectionSystem:
     def __init__(self):
@@ -22,15 +28,30 @@ class PoseDetectionSystem:
             self.detector = PoseDetector(OPENPOSE_CONFIG)
             # 初始化检测器和分析器
             self.analyzer = PoseAnalyzer()
-            self.smoother = KeypointSmoother(SMOOTHER_WINDOW_SIZE)
+            self.smoother = KeypointSmoother(ANALYZER_CONFIG['SMOOTHER_WINDOW_SIZE'])
             self.pose_fusion = PoseFusion()
-            self.stability_analyzer = PostureStabilityAnalyzer(STABILITY_WINDOW_SIZE)
+            self.stability_analyzer = PostureStabilityAnalyzer(
+                ANALYZER_CONFIG['STABILITY_WINDOW_SIZE']
+            )
             self.consistency_checker = SkeletonConsistencyChecker()
-            self.trajectory_analyzer = KeypointTrajectoryAnalyzer(TRAJECTORY_WINDOW_SIZE)
+            self.trajectory_analyzer = KeypointTrajectoryAnalyzer(
+                ANALYZER_CONFIG['TRAJECTORY_WINDOW_SIZE']
+            )
             self.pose_prior = PosePriorKnowledge()
             
             # 存储最后的处理结果
             self.last_results = None
+            
+            self.fps_history = deque(maxlen=30)  # 添加FPS历史记录
+            self.processing_times = deque(maxlen=30)  # 添加处理时间历史
+            
+            # 添加帧跳过逻辑
+            self.frame_count = 0
+            self.process_every_n_frames = 2  # 每2帧处理一次
+            
+            # 添加缓存
+            self.last_valid_results = None
+            self.last_process_time = 0
             
         except Exception as e:
             print(f"初始化错误: {str(e)}")
@@ -46,12 +67,41 @@ class PoseDetectionSystem:
             print(f"资源释放错误: {str(e)}")
         
     def process_frame(self, frame):
+        current_time = time.time()
+        self.frame_count += 1
+        
+        # 检查是否需要处理这一帧
+        if (self.frame_count % self.process_every_n_frames != 0 and 
+            self.last_valid_results is not None and
+            current_time - self.last_process_time < 0.1):  # 100ms内
+            return self.last_valid_results
+            
+        # 处理新帧
+        results = self._process_frame_internal(frame)
+        if results is not None:
+            self.last_valid_results = results
+            self.last_process_time = current_time
+            
+        return results
+        
+    def _process_frame_internal(self, frame):
         """处理单帧图像"""
         try:
             start_time = time.time()
             
+            # 添加帧有效性检查
+            if frame is None or frame.size == 0:
+                raise ValueError("Invalid frame")
+            
             # 执行姿态检测
             detection_results = self.detector.detect(frame)
+            
+            # 使用prior knowledge增强检测结果
+            if detection_results['keypoints']['yolo'] is not None:
+                confidence_factor = self.pose_prior.check_pose_validity(
+                    detection_results['keypoints']['yolo']
+                )
+                detection_results['keypoints']['yolo'][:, 2] *= confidence_factor
             
             # 初始化混合帧
             mixed_frame = frame.copy()
@@ -100,6 +150,11 @@ class PoseDetectionSystem:
                             'stability': stability_results['warnings']
                         }
             
+            # 更新性能指标
+            process_time = time.time() - start_time
+            self.processing_times.append(process_time)
+            self.fps_history.append(1.0 / process_time)
+            
             return (
                 detection_results['frames']['openpose'],
                 detection_results['frames']['yolo'],
@@ -107,8 +162,13 @@ class PoseDetectionSystem:
             )
             
         except Exception as e:
-            print(f"处理帧时发生错误: {str(e)}")
-            return frame, frame, frame
+            self.logger.error(f"处理帧时发生错误: {str(e)}")
+            # 返回带有错误提示的帧
+            error_frame = frame.copy()
+            cv2.putText(error_frame, "Error: " + str(e),
+                        (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1,
+                        (0, 0, 255), 2)
+            return error_frame, error_frame, error_frame
             
     def get_last_results(self):
         """获取最近的处理结果"""
@@ -120,25 +180,25 @@ def main():
     logger.info("系统启动")
     
     # 检查视频输入配置
-    if not USE_CAMERA and not os.path.exists(VIDEO_PATH):
-        print(f"错误：视频文件不存在 - {VIDEO_PATH}")
+    if not VIDEO_CONFIG['USE_CAMERA'] and not os.path.exists(VIDEO_CONFIG['VIDEO_PATH']):
+        print(f"错误：视频文件不存在 - {VIDEO_CONFIG['VIDEO_PATH']}")
         sys.exit(1)
         
     # 初始化视频捕获
-    if USE_CAMERA:
-        cap = cv2.VideoCapture(CAMERA_ID)
+    if VIDEO_CONFIG['USE_CAMERA']:
+        cap = cv2.VideoCapture(VIDEO_CONFIG['CAMERA_ID'])
         if not cap.isOpened():
-            print(f"错误：无法打开摄像头 ID {CAMERA_ID}")
+            print(f"错误：无法打开摄像头 ID {VIDEO_CONFIG['CAMERA_ID']}")
             sys.exit(1)
     else:
-        cap = cv2.VideoCapture(VIDEO_PATH)
+        cap = cv2.VideoCapture(VIDEO_CONFIG['VIDEO_PATH'])
         if not cap.isOpened():
-            print(f"错误：无法打开视频文件 {VIDEO_PATH}")
+            print(f"错误：无法打开视频文件 {VIDEO_CONFIG['VIDEO_PATH']}")
             sys.exit(1)
             
     # 设置视频分辨率
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, DISPLAY_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, DISPLAY_HEIGHT)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, DISPLAY_CONFIG['WINDOW_WIDTH'])
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, DISPLAY_CONFIG['WINDOW_HEIGHT'])
     
     # 创建窗口
     window_name = 'Pose Detection System'

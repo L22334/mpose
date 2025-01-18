@@ -1,7 +1,12 @@
 # 视频输入配置
-USE_CAMERA = False  # 设置为False则使用视频文件
-CAMERA_ID = 0     # 摄像头ID
-VIDEO_PATH = "video/output_video.mp4"  # 视频文件路径
+VIDEO_CONFIG = {
+    'USE_CAMERA': False,
+    'CAMERA_ID': 0,
+    'VIDEO_PATH': "video/output_video.mp4",
+    'FRAME_WIDTH': 1920,
+    'FRAME_HEIGHT': 1080,
+    'TARGET_FPS': 30
+}
 
 # OpenPose配置
 OPENPOSE_CONFIG = {
@@ -13,11 +18,19 @@ OPENPOSE_CONFIG = {
     "render_threshold": 0.05
 }
 
-# 分析器参数配置
-SMOOTHER_WINDOW_SIZE = 5      # 平滑器窗口大小
-STABILITY_WINDOW_SIZE = 30    # 稳定性分析窗口大小
-TRAJECTORY_WINDOW_SIZE = 30   # 轨迹分析窗口大小
+# 分析器配置
+ANALYZER_CONFIG = {
+    'SMOOTHER_WINDOW_SIZE': 5,
+    'STABILITY_WINDOW_SIZE': 30,
+    'TRAJECTORY_WINDOW_SIZE': 30,
+    'MIN_CONFIDENCE': 0.5,
+    'MAX_DETECTION_AGE': 1.0  # 秒
+}
 
 # 显示配置
-DISPLAY_WIDTH = 1920
-DISPLAY_HEIGHT = 1080 
+DISPLAY_CONFIG = {
+    'WINDOW_WIDTH': 1920,
+    'WINDOW_HEIGHT': 1080,
+    'SHOW_FPS': True,
+    'SHOW_DEBUG_INFO': True
+} 
