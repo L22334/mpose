@@ -53,8 +53,11 @@ class PoseFusion:
         
         for key in ref_proportions:
             if key in test_proportions:
-                ratio = test_proportions[key] / ref_proportions[key]
-                if not (0.7 <= ratio <= 1.3):
+                if ref_proportions[key] > 1e-6:  # 避免除以接近零的值
+                    ratio = test_proportions[key] / ref_proportions[key]
+                    if not (0.7 <= ratio <= 1.3):
+                        return False
+                else:
                     return False
                     
         return True

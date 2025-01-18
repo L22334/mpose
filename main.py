@@ -26,6 +26,9 @@ class PoseDetectionSystem:
     def __init__(self):
         # 添加错误处理
         try:
+            # 添加 logger 初始化
+            self.logger = setup_logger()
+            
             self.detector = PoseDetector(OPENPOSE_CONFIG)
             # 初始化检测器和分析器
             self.analyzer = PoseAnalyzer()
