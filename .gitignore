@@ -31,3 +31,6 @@ openpose/
 # IDE
 .vscode/
 .idea/ 
+
+# 日志文件
+logs/
